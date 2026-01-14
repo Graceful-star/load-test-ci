@@ -35,11 +35,9 @@ This repository implements a CI/CD pipeline for load testing multi-node Kubernet
 ## Local Development
 
 ```bash
-# Run load test locally
 chmod +x scripts/*.sh
 ./scripts/setup-kind.sh
 ./scripts/deploy-apps.sh
 ./scripts/load-test.sh
 
-# Clean up
 kind delete cluster --name load-test-cluster
