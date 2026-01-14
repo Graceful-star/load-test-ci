@@ -1,0 +1,64 @@
+name: CI Load Test
+
+on:
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  load-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+
+      - name: Install kind
+        run: |
+          curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.20.0/kind-linux-amd64
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - name: Install hey
+        run: go install github.com/rakyll/hey@latest
+
+      - name: Create KinD cluster
+        run: kind create cluster --config kind-config.yaml --name ci-load-test
+
+      - name: Deploy Ingress-NGINX
+        run: |
+          kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/kind/deploy.yaml
+          kubectl wait --namespace ingress-nginx --for=condition=ready pod --selector=app.kubernetes.io/component=controller --timeout=180s
+
+      - name: Deploy foo and bar
+        run: |
+          kubectl apply -f deploy-foo.yaml
+          kubectl apply -f deploy-bar.yaml
+          kubectl apply -f ingress.yaml
+          kubectl rollout status deployment/foo --timeout=120s
+          kubectl rollout status deployment/bar --timeout=120s
+
+      - name: Run load test
+        run: |
+          export PATH=$PATH:$(go env GOPATH)/bin
+          bash load-test.sh
+
+      - name: Post results to PR
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          body=$(jq -Rs . < load-test-results.md)
+          curl -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+               -H "Accept: application/vnd.github.v3+json" \
+               -d "{\"body\": $body}" \
+               https://api.github.com/repos/${{ github.repository }}/issues/${{ github.event.number }}/comments
