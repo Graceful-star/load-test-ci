@@ -1,4 +1,4 @@
-name: CI Load Test
+name: CI Load Test with k6
 
 on:
   pull_request:
@@ -24,13 +24,16 @@ jobs:
           chmod +x ./kind
           sudo mv ./kind /usr/local/bin/kind
 
-      - name: Install Go
-        uses: actions/setup-go@v5
+      - name: Install Node.js (for k6)
+        uses: actions/setup-node@v4
         with:
-          go-version: '1.21'
+          node-version: '20'
 
-      - name: Install hey
-        run: go install github.com/rakyll/hey@latest
+      - name: Install k6
+        run: |
+          curl https://github.com/grafana/k6/releases/download/v0.53.0/k6-v0.53.0-linux-amd64.tar.gz -L -s | tar xvz --strip-components=1
+          chmod +x k6
+          sudo mv k6 /usr/local/bin/k6
 
       - name: Create KinD cluster
         run: kind create cluster --config kind-config.yaml --name ci-load-test
@@ -38,9 +41,12 @@ jobs:
       - name: Deploy Ingress-NGINX
         run: |
           kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/kind/deploy.yaml
-          kubectl wait --namespace ingress-nginx --for=condition=ready pod --selector=app.kubernetes.io/component=controller --timeout=180s
+          kubectl wait --namespace ingress-nginx \
+            --for=condition=ready pod \
+            --selector=app.kubernetes.io/component=controller \
+            --timeout=180s
 
-      - name: Deploy foo and bar
+      - name: Deploy foo and bar services
         run: |
           kubectl apply -f deploy-foo.yaml
           kubectl apply -f deploy-bar.yaml
@@ -48,17 +54,45 @@ jobs:
           kubectl rollout status deployment/foo --timeout=120s
           kubectl rollout status deployment/bar --timeout=120s
 
-      - name: Run load test
+      - name: Run k6 load test
+        run: k6 run load-test.js --summary-export=results.json
+
+      - name: Generate markdown report from k6 results
         run: |
-          export PATH=$PATH:$(go env GOPATH)/bin
-          bash load-test.sh
+          # Simple extraction - you can make this more sophisticated
+          cat <<EOF > load-test-results.md
+          ## k6 Load Test Results (30s, 20 VUs)
+
+          **Test script**: Randomized traffic between foo.localhost & bar.localhost
+
+          \`\`\`json
+          $(cat results.json | jq .metrics)
+          \`\`\`
+
+          ### Key Metrics:
+          - **http_req_duration** (response time):
+            - avg: $(jq -r '.metrics.http_req_duration.values.avg' results.json) ms
+            - p(90): $(jq -r '.metrics.http_req_duration.values."p(90)"' results.json) ms
+            - p(95): $(jq -r '.metrics.http_req_duration.values."p(95)"' results.json) ms
+          - **http_req_failed** (error rate): $(jq -r '.metrics.http_req_failed.values.rate * 100' results.json)% 
+          - **requests per second** (approx): $(jq -r '.metrics.http_reqs.values.rate' results.json | awk '{printf "%.1f", $1}')
+          - **Total requests**: $(jq -r '.metrics.http_reqs.values.count' results.json)
+
+          Full raw JSON results are available in workflow artifacts.
+          EOF
+
+      - name: Upload k6 results as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: k6-results
+          path: results.json
 
       - name: Post results to PR
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           body=$(jq -Rs . < load-test-results.md)
-          curl -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+          curl -H "Authorization: token $GITHUB_TOKEN" \
                -H "Accept: application/vnd.github.v3+json" \
                -d "{\"body\": $body}" \
                https://api.github.com/repos/${{ github.repository }}/issues/${{ github.event.number }}/comments
